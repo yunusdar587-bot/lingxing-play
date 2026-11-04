@@ -209,7 +209,7 @@ function statusTag(st, okText) {
 }
 
 function renderMskuTable(detail) {
-  const mode = state.mode;
+  const mode = state.mode === "order" && detail.summary.order.fallback_to_daily ? "daily" : state.mode;
   const head = `<tr><th>MSKU</th><th class="num">销量</th><th class="num">Q</th><th class="num">预计退货成本</th>
     <th class="num">单件弃置费</th><th class="num">单日仓储费</th><th class="num">已过时段仓储</th>
     <th>订单仓储费</th><th class="num">调整后毛利</th></tr>`;
