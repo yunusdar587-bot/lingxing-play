@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>四站当日调整后利润看板</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>四站当日调整后利润</h1>
+      <span class="sub" id="generated">加载中…</span>
+    </div>
+    <div class="mode-switch" role="tablist" aria-label="仓储模式">
+      <button data-mode="daily" class="active" role="tab">今日已过时段的在库仓储</button>
+      <button data-mode="order" role="tab">今日已售出件数的在仓仓储</button>
+    </div>
+  </header>
+
+  <div id="sign-banner" class="banner hidden"></div>
+
+  <main class="layout">
+    <section class="col-main">
+      <div class="total-card card">
+        <div class="total-head">
+          <span class="label">全部店铺人民币合计（各店「本店今天」相加）</span>
+          <span class="mode-tag" id="total-mode"></span>
+        </div>
+        <div class="total-value" id="total-value">—</div>
+        <div class="total-tz" id="total-tz"></div>
+      </div>
+
+      <div class="stores" id="stores"></div>
+
+      <div class="card detail hidden" id="detail">
+        <div class="detail-head">
+          <div>
+            <h2 id="detail-title"></h2>
+            <div class="sub" id="detail-sub"></div>
+          </div>
+          <div class="detail-kpi">
+            <div class="kpi-label">调整后毛利</div>
+            <div class="kpi-value" id="detail-adjusted">—</div>
+            <div class="sub" id="detail-margin"></div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <h3>利润构成：原毛利 → 调整后毛利</h3>
+            <table class="waterfall" id="waterfall"></table>
+            <div class="sub" id="waterfall-note"></div>
+          </div>
+          <div>
+            <h3>仍留在毛利中的费用 <span class="sub">（接口原值，已含在原毛利里）</span></h3>
+            <table class="retained" id="retained"></table>
+            <h3 class="mt">今日日内曲线 <span class="sub">（每次轮询的调整后毛利）</span></h3>
+            <div id="curve" class="curve"></div>
+          </div>
+        </div>
+
+        <h3 class="mt">MSKU 明细</h3>
+        <div class="table-wrap">
+          <table class="msku" id="msku-table"></table>
+        </div>
+      </div>
+    </section>
+
+    <aside class="col-side">
+      <div class="card">
+        <h3>价目表版本</h3>
+        <div id="price"></div>
+      </div>
+      <div class="card">
+        <h3>提示</h3>
+        <ul class="notices" id="notices"></ul>
+      </div>
+      <details class="card">
+        <summary>轮询记录</summary>
+        <table class="mini" id="polls"></table>
+      </details>
+      <details class="card">
+        <summary>队列与数据异常</summary>
+        <ul class="mini-list" id="anomalies"></ul>
+      </details>
+    </aside>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
