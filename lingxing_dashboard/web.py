@@ -1,4 +1,4 @@
-"""本地网页看板。写入只有两处：确认新价目版本，以及手填 MSKU 退货率。"""
+"""本地网页看板。写入：保存排行榜配置（含手填退货率）、确认新价目版本、单条手填 MSKU 退货率。"""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from .calc import MODE_DAILY, MODE_LABELS, MODE_ORDER
 from .history import assemble
 from .jobs import Engine
+from .leaderboard import ConfigError, LeaderboardService
 from .sites import SITES
 from .timeutil import iso, local_now
 
@@ -46,6 +47,7 @@ class DashboardService:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.db = engine.db
+        self.board = LeaderboardService(engine)
 
     def _sign(self) -> dict:
         return self.db.get("sign_check") or {"status": "pending", "cost_sign": self.engine.cfg.cost_sign}
@@ -257,10 +259,21 @@ def make_handler(service: DashboardService):
             path = parsed.path
             query = parse_qs(parsed.query)
             try:
+                if path == "/favicon.ico":
+                    self.send_response(HTTPStatus.NO_CONTENT)
+                    self.end_headers()
+                    return None
                 if path in ("/", "/index.html"):
                     return self._static("index.html")
                 if path.startswith("/static/"):
                     return self._static(path[len("/static/"):])
+                if path == "/api/config":
+                    return self._json(service.board.config_page())
+                if path == "/api/leaderboard":
+                    try:
+                        return self._json(service.board.leaderboard())
+                    except ConfigError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
                 if path == "/api/dashboard":
                     return self._json(service.dashboard())
                 if path == "/api/history/bounds":
@@ -286,6 +299,12 @@ def make_handler(service: DashboardService):
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except (ValueError, json.JSONDecodeError):
                 return self._json({"error": "参数错误"}, HTTPStatus.BAD_REQUEST)
+            if path == "/api/config":
+                try:
+                    config = service.board.save_config(payload)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return self._json({"ok": True, "config": config})
             if path == "/api/price-table/confirm":
                 try:
                     state = service.engine.confirm_price(str(payload.get("version") or ""))
