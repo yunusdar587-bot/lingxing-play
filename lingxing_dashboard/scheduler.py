@@ -98,12 +98,14 @@ class Scheduler:
         self.trigger_poll(self.clock())
         self.ready.set()
         next_poll = next_boundary(self.clock(), self.poll_minutes)
+        self.db.set("next_poll_at", iso(next_poll))
         last_store_refresh = self.clock()
         while not self._stop.is_set():
             now = self.clock()
             if now >= next_poll:
                 self.trigger_poll(next_poll)
                 next_poll = next_boundary(now, self.poll_minutes)
+                self.db.set("next_poll_at", iso(next_poll))
             if now - last_store_refresh > timedelta(hours=24):
                 try:
                     self.engine.refresh_stores()
