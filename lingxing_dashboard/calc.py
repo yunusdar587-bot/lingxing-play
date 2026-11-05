@@ -54,6 +54,8 @@ class StoreContext:
     cost_sign: str = "negative"
     storage_report_pending: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+    # 领星查不到退货率时，看板配置里人工给出的 Q：msku -> (zero | pct, Q)
+    q_manual: dict[str, tuple[str, float]] = field(default_factory=dict)
 
     @property
     def country(self) -> str:
@@ -162,6 +164,10 @@ def compute_rows(ctx: StoreContext) -> list[dict]:
 
         # ---- 预计退货成本
         q = ctx.q.q.get(msku)
+        q_source = "lingxing" if q is not None else None
+        if q is None and msku in ctx.q_manual:
+            kind, q = ctx.q_manual[msku]
+            q_source = f"manual_{kind}"
         net, selling = p["net_amount"], p["selling_fee"]
         if net == 0 and afn == 0:
             rc, rc_status = 0.0, "ok"
@@ -231,6 +237,7 @@ def compute_rows(ctx: StoreContext) -> list[dict]:
             "retained": {f: p.get(f) for f in RETAINED_FIELDS},
             "q": q,
             "q_flagged": msku in ctx.q.flagged,
+            "q_source": q_source,
             "return_cost": rc,
             "return_cost_status": rc_status,
             "disposal_unit_local": disp_local,
@@ -239,6 +246,7 @@ def compute_rows(ctx: StoreContext) -> list[dict]:
             "disposal_note": disp_note,
             "size_tier": dims.size_tier if dims else "",
             "dims_month": dims.month if dims else None,
+            "dims_source": "storage_report" if dims else None,
             "daily_storage_cny": daily_cny,
             "elapsed_storage_cny": elapsed_cny,
             "daily_storage_status": daily_status,

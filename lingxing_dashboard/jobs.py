@@ -401,6 +401,14 @@ class Engine:
                 self.db.set(f"fifo_closed:{sid}:{yday}", True, conn=c)
 
     # ------------------------------------------------------------------ 快照
+    def q_manual(self, sid: int) -> dict[str, tuple[str, float]]:
+        out = {}
+        for key, v in (self.db.get("q_overrides") or {}).items():
+            ksid, msku = key.split("|", 1)
+            if int(ksid) == sid:
+                out[msku] = (v["kind"], 0.0 if v["kind"] == "zero" else float(v["pct"]) / 100.0)
+        return out
+
     def build_context(self, sid: int, now: datetime) -> StoreContext:
         st = self.store(sid)
         assert st
@@ -416,6 +424,7 @@ class Engine:
             fx=fx_rate(self.db, site.currency, today), price=self.active_price(),
             sold=fifo.sold_today(self.db, sid, today), t0=self.db.get(fifo.t0_key(sid)),
             cost_sign=self.cfg.cost_sign,
+            q_manual=self.q_manual(sid),
             storage_report_pending=not (pending and pending["status"] == "success"),
         )
 

@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from .calc import MODE_DAILY, MODE_LABELS, MODE_ORDER
 from .jobs import Engine
+from .leaderboard import ConfigError, LeaderboardService
 from .sites import SITES
 from .timeutil import iso, local_now
 
@@ -45,6 +46,7 @@ class DashboardService:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.db = engine.db
+        self.board = LeaderboardService(engine)
 
     def _sign(self) -> dict:
         return self.db.get("sign_check") or {"status": "pending", "cost_sign": self.engine.cfg.cost_sign}
@@ -240,6 +242,13 @@ def make_handler(service: DashboardService):
                     return self._static("index.html")
                 if path.startswith("/static/"):
                     return self._static(path[len("/static/"):])
+                if path == "/api/config":
+                    return self._json(service.board.config_page())
+                if path == "/api/leaderboard":
+                    try:
+                        return self._json(service.board.leaderboard())
+                    except ConfigError as exc:
+                        return self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
                 if path == "/api/dashboard":
                     return self._json(service.dashboard())
                 if path.startswith("/api/store/"):
@@ -250,11 +259,14 @@ def make_handler(service: DashboardService):
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self):  # noqa: N802
-            if urlparse(self.path).path != "/api/price-table/confirm":
-                return self._json({"error": "只读看板，不支持该写入"}, HTTPStatus.METHOD_NOT_ALLOWED)
+            path = urlparse(self.path).path
+            if path not in ("/api/price-table/confirm", "/api/config"):
+                return self._json({"error": "不支持该写入"}, HTTPStatus.METHOD_NOT_ALLOWED)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(length) or b"{}")
+                if path == "/api/config":
+                    return self._json({"ok": True, "config": service.board.save_config(payload)})
                 state = service.engine.confirm_price(str(payload.get("version") or ""))
             except ValueError as exc:
                 return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
