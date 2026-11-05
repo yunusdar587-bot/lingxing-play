@@ -24,12 +24,28 @@
     <section class="col-main">
       <div class="total-card card">
         <div class="total-head">
-          <span class="label">全部店铺人民币合计（各店「本店今天」相加）</span>
+          <span class="label" id="total-label">全部店铺人民币合计（各店「本店今天」相加）</span>
           <span class="mode-tag" id="total-mode"></span>
         </div>
         <div class="total-value" id="total-value">—</div>
-        <div class="total-tz" id="total-tz"></div>
+        <details class="store-pick" id="store-pick">
+          <summary id="store-pick-summary">参与合计的店铺</summary>
+          <div class="total-tz" id="total-tz"></div>
+        </details>
       </div>
+
+      <details class="card" id="history-card">
+        <summary>历史数据</summary>
+        <div class="history-body">
+          <div class="history-form">
+            <label>开始 <input id="hist-start" type="datetime-local" step="900"></label>
+            <label>结束 <input id="hist-end" type="datetime-local" step="900"></label>
+            <button class="btn" id="hist-load" type="button">拉取</button>
+          </div>
+          <div class="sub" id="hist-note">按各店自己的时区，只返回库里已留存的 15 分钟刻度。</div>
+          <div id="hist-result"></div>
+        </div>
+      </details>
 
       <div class="stores" id="stores"></div>
 
@@ -72,10 +88,10 @@
         <h3>价目表版本</h3>
         <div id="price"></div>
       </div>
-      <div class="card">
-        <h3>提示</h3>
+      <details class="card" id="notice-card">
+        <summary>提示</summary>
         <ul class="notices" id="notices"></ul>
-      </div>
+      </details>
       <details class="card">
         <summary>轮询记录</summary>
         <table class="mini" id="polls"></table>

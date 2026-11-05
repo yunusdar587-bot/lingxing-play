@@ -1,14 +1,14 @@
 """服务端计算：预计退货成本、两种仓储费、调整后毛利、店铺汇总、符号验收。"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any
 
 from . import pricing
 from .fields import REPLACED_FIELDS, RETAINED_FIELDS
 from .fifo import SoldPiece
-from .refdata import AgeSnapshot, DimsSet, FxRate, ReturnRates
+from .refdata import AgeSnapshot, AgeVolume, DimsSet, FxRate, ReturnRates
 from .sites import Site
 from .timeutil import days_in_month, elapsed_fraction, from_iso, month_str
 
@@ -52,6 +52,7 @@ class StoreContext:
     sold: dict[str, list[SoldPiece]]
     t0: str | None
     cost_sign: str = "negative"
+    listing_dims: dict[str, pricing.Dims] = field(default_factory=dict)
     storage_report_pending: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -73,6 +74,22 @@ def _zero_profit(msku: str, sid: int) -> dict:
     for f in RETAINED_FIELDS:
         row[f] = None
     return row
+
+
+def storage_dims(ctx: StoreContext, msku: str, base: pricing.Dims | None) -> pricing.Dims | None:
+    """月仓储费报告有体积时用它，库龄体积只覆盖这一档的体积数字。
+
+    报告里查不到体积时用 Listing 的包装长宽高和重量，不再用库龄体积补。
+    """
+    if base is not None and base.volume_cm3():
+        vol: AgeVolume | None = ctx.age.volumes.get(msku) if ctx.age else None
+        if vol is not None and vol.volume > 0 and pricing.volume_factor(vol.unit) is not None:
+            return replace(base, volume=vol.volume, volume_unit=vol.unit)
+        return base
+    listed = ctx.listing_dims.get(msku)
+    if listed is not None and listed.volume_cm3():
+        return listed
+    return None
 
 
 def daily_storage_local(ctx: StoreContext, buckets: dict[str, float], dims: pricing.Dims | None,
@@ -112,7 +129,7 @@ def order_storage_local(ctx: StoreContext, msku: str, pieces: list[SoldPiece]) -
         per_unit = 0.0
         d = p.receive_date
         while d <= sale_day:
-            dims = ctx.dims.for_month(msku, month_str(d))
+            dims = storage_dims(ctx, msku, ctx.dims.for_month(msku, month_str(d)))
             if dims is None:
                 return None, "no_volume"
             age = (d - p.receive_date).days
@@ -141,35 +158,40 @@ def compute_rows(ctx: StoreContext) -> list[dict]:
         else:
             p = {**p, "in_order_profit": True}
         dims = ctx.dims.current(msku)
+        measured = storage_dims(ctx, msku, dims)
         afn = max(0.0, p["afn_volume"])
 
-        # ---- 单件弃置费
+        # ---- 单件弃置费。仓储报告没有体积时，重量和边长用 Listing。
         disp_status = "ok"
         disp_local = None
         disp_note = ""
-        if not ctx.dims.months:
-            disp_status = "no_report"
-        elif dims is None:
-            unmapped_now = ctx.dims.unmapped.get(ctx.dims.latest_month or "", set())
-            disp_status = "unmapped" if (p["fnsku"] and p["fnsku"] in unmapped_now) else "no_dims"
+        disp_dims = dims if dims is not None and dims.volume_cm3() else measured
+        if disp_dims is None:
+            if not ctx.dims.months:
+                disp_status = "no_report"
+            elif dims is None:
+                unmapped_now = ctx.dims.unmapped.get(ctx.dims.latest_month or "", set())
+                disp_status = "unmapped" if (p["fnsku"] and p["fnsku"] in unmapped_now) else "no_dims"
+            else:
+                disp_status = "no_dims"
         else:
-            disp_local, disp_note = pricing.disposal_fee_local(ctx.price, ctx.country, dims)
+            disp_local, disp_note = pricing.disposal_fee_local(ctx.price, ctx.country, disp_dims)
             if disp_local is None:
                 disp_status = "no_rate"
             elif rate is None:
                 disp_status = "no_fx"
         disposal_cny = disp_local * rate if (disp_local is not None and rate is not None) else 0.0
 
-        # ---- 预计退货成本
-        q = ctx.q.q.get(msku)
+        # ---- 预计退货成本。查不到 Q 时按 0，手填覆盖接口值。
         net, selling = p["net_amount"], p["selling_fee"]
-        if net == 0 and afn == 0:
-            rc, rc_status = 0.0, "ok"
-        elif q is None:
-            rc, rc_status = None, "no_q"
+        if msku in ctx.q.manual:
+            q, q_source = ctx.q.q[msku], "manual"
+        elif msku in ctx.q.q:
+            q, q_source = ctx.q.q[msku], "api"
         else:
-            disposal_part = disposal_cny * afn if afn > 0 else 0.0
-            rc, rc_status = q * (net - 0.8 * abs(selling) + disposal_part), "ok"
+            q, q_source = 0.0, "assumed"
+        disposal_part = disposal_cny * afn if afn > 0 else 0.0
+        rc, rc_status = q * (net - 0.8 * abs(selling) + disposal_part), "ok"
 
         # ---- 单日仓储费（日模式）
         buckets = ctx.age.by_msku.get(msku) if ctx.age else None
@@ -179,7 +201,7 @@ def compute_rows(ctx: StoreContext) -> list[dict]:
         if buckets is None:
             daily_status = "no_age"
         else:
-            local, err, bucket_detail = daily_storage_local(ctx, buckets, dims, ctx.local_date)
+            local, err, bucket_detail = daily_storage_local(ctx, buckets, measured, ctx.local_date)
             if err:
                 daily_status = err
             elif local and rate is None:
@@ -218,7 +240,7 @@ def compute_rows(ctx: StoreContext) -> list[dict]:
 
         rows.append({
             "msku": msku,
-            "fnsku": p["fnsku"] or (dims.fnsku if dims else ""),
+            "fnsku": p["fnsku"] or (disp_dims.fnsku if disp_dims else ""),
             "asin": p["asin"],
             "local_name": p["local_name"],
             "in_order_profit": p["in_order_profit"],
@@ -230,15 +252,16 @@ def compute_rows(ctx: StoreContext) -> list[dict]:
             "addbacks": addbacks,
             "retained": {f: p.get(f) for f in RETAINED_FIELDS},
             "q": q,
-            "q_flagged": msku in ctx.q.flagged,
+            "q_source": q_source,
+            "q_flagged": q_source == "api" and msku in ctx.q.flagged,
             "return_cost": rc,
             "return_cost_status": rc_status,
             "disposal_unit_local": disp_local,
             "disposal_unit_cny": disposal_cny,
             "disposal_status": disp_status,
             "disposal_note": disp_note,
-            "size_tier": dims.size_tier if dims else "",
-            "dims_month": dims.month if dims else None,
+            "size_tier": (dims.size_tier if dims and dims.size_tier else (disp_dims.size_tier if disp_dims else "")),
+            "dims_month": dims.month if dims and dims.volume_cm3() else (disp_dims.month if disp_dims else None),
             "daily_storage_cny": daily_cny,
             "elapsed_storage_cny": elapsed_cny,
             "daily_storage_status": daily_status,
@@ -317,7 +340,7 @@ def summarize(rows: list[dict]) -> dict:
         MODE_DAILY: daily,
         MODE_ORDER: order,
         "msku_count": len(rows),
-        "no_q_mskus": sum(1 for r in rows if r["return_cost_status"] == "no_q"),
+        "no_q_mskus": sum(1 for r in rows if r["q_source"] == "assumed" and (r["afn_volume"] or r["net_amount"])),
         "disposal_issue_counts": _count(rows, "disposal_status"),
         "daily_storage_issue_counts": _count(rows, "daily_storage_status"),
         "order_storage_issue_counts": _count(rows, "order_storage_status"),

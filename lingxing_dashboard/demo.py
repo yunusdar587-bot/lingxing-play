@@ -52,6 +52,7 @@ class FakeLingxing:
         self.clock = clock
         self.calls: list[tuple[str, dict]] = []
         self.storage_report_ready = storage_report_ready or {104: False}
+        self.empty_storage_months: dict[int, set[str]] = {}
         self.cost_sign = cost_sign
         self.receipts: dict[int, list[dict]] = {}
         self.age_override: dict[int, list[dict]] = {}
@@ -210,6 +211,8 @@ class FakeLingxing:
     def _storage_month(self, p):
         sid = int(p["sid"])
         if not self.storage_report_ready.get(sid, True):
+            return []
+        if p.get("month") in self.empty_storage_months.get(sid, ()):
             return []
         lu, wu, vu, lf, wf, vf = UNITS[SID_SITE[sid]]
         rows = []

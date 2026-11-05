@@ -11,8 +11,12 @@ from .calc import StoreContext, compute_rows, sign_check, summarize
 from .config import Config
 from .db import Database
 from .fields import aggregate, normalize_row, num, parse_return_rate
+from .history import HistoryDB, history_db_path
 from .lingxing import LingxingApi
-from .refdata import fx_months_to_try, fx_rate, load_age_snapshot, load_dims, load_return_rates, snapshot_date_of
+from .refdata import (
+    fx_months_to_try, fx_rate, load_age_snapshot, load_dims, load_listing_dims, load_return_rates,
+    snapshot_date_of,
+)
 from .sites import SITES, Site, site_for_seller
 from .timeutil import iso, local_now, month_str, parse_date, parse_local_datetime, prev_month, utcnow
 
@@ -25,14 +29,18 @@ TASK_DAILY = "daily"
 
 Q_LAG_DAYS = 30
 Q_WINDOW_START_DAYS = 395
+# 上月月仓储费报告未出时，最多再向前查这么多个月。
+STORAGE_MONTH_LOOKBACK = 12
 
 
 class Engine:
-    def __init__(self, cfg: Config, db: Database, api: LingxingApi, clock: Callable[[], datetime] = utcnow):
+    def __init__(self, cfg: Config, db: Database, api: LingxingApi, clock: Callable[[], datetime] = utcnow,
+                 history: HistoryDB | None = None):
         self.cfg = cfg
         self.db = db
         self.api = api
         self.clock = clock
+        self.history = history or HistoryDB(history_db_path(cfg.db_path))
 
     # ------------------------------------------------------------------ 工具
     def _status(self, sid: int, task: str, period: str):
@@ -144,28 +152,34 @@ class Engine:
     def task_listing(self, sid: int) -> tuple[str, str]:
         rows = self.api.listing(sid)
         now = iso(self.clock())
-        mapping: dict[str, str] = {}
+        mapping: dict[str, tuple[str, str | None]] = {}
         conflicts = 0
         for r in rows:
             fnsku = str(r.get("fnsku") or "").strip()
             msku = str(r.get("seller_sku") or r.get("msku") or "").strip()
             if not fnsku or not msku:
                 continue
-            if fnsku in mapping and mapping[fnsku] != msku:
+            if fnsku in mapping and mapping[fnsku][0] != msku:
                 conflicts += 1
                 continue
-            mapping[fnsku] = msku
+            info = r.get("dimension_info")
+            if isinstance(info, list):
+                info = next((x for x in info if isinstance(x, dict) and x), None)
+            dimension = json.dumps(info, ensure_ascii=False) if isinstance(info, dict) and info else None
+            mapping[fnsku] = (msku, dimension)
         with self.db.tx() as c:
             c.execute("DELETE FROM listing_map WHERE sid=?", (sid,))
-            c.executemany("INSERT INTO listing_map(sid,fnsku,msku,updated_at) VALUES(?,?,?,?)",
-                          [(sid, f, m, now) for f, m in mapping.items()])
-        return "success", f"{len(mapping)} 条 fnsku 映射" + (f"，{conflicts} 条一对多保留首条" if conflicts else "")
+            c.executemany(
+                "INSERT INTO listing_map(sid,fnsku,msku,updated_at,dimension) VALUES(?,?,?,?,?)",
+                [(sid, f, m, now, dim) for f, (m, dim) in mapping.items()],
+            )
+        n_dim = sum(1 for _, dim in mapping.values() if dim)
+        msg = f"{len(mapping)} 条 fnsku 映射，{n_dim} 条有尺寸"
+        if conflicts:
+            msg += f"，{conflicts} 条一对多保留首条"
+        return "success", msg
 
-    def task_storage_month(self, sid: int, month_day: date) -> tuple[str, str]:
-        month = month_str(month_day)
-        rows = self.api.storage_fee_month(sid, month)
-        if not rows:
-            return "not_ready", f"{month} 月仓储费报告未出"
+    def _save_storage_rows(self, sid: int, month: str, rows: list[dict]) -> None:
         now = iso(self.clock())
         with self.db.tx() as c:
             c.execute("DELETE FROM storage_fee_rows WHERE sid=? AND month=?", (sid, month))
@@ -180,7 +194,30 @@ class Engine:
                     "fetched_at=excluded.fetched_at",
                     (sid, fnsku, month, fc, json.dumps(r, ensure_ascii=False), now),
                 )
-        return "success", f"{month} 共 {len(rows)} 行"
+
+    def _stored_storage_months(self, sid: int) -> set[str]:
+        return {r["month"] for r in self.db.query(
+            "SELECT DISTINCT month FROM storage_fee_rows WHERE sid=?", (sid,))}
+
+    def task_storage_month(self, sid: int, month_day: date) -> tuple[str, str]:
+        """先查目标月。该月报告未出时逐月向前，用最近一份已有报告，目标月保持未就绪以便每天重试。"""
+        month = month_str(month_day)
+        rows = self.api.storage_fee_month(sid, month)
+        if rows:
+            self._save_storage_rows(sid, month, rows)
+            return "success", f"{month} 共 {len(rows)} 行"
+        stored = self._stored_storage_months(sid)
+        cursor = month_day
+        for _ in range(STORAGE_MONTH_LOOKBACK):
+            cursor = prev_month(cursor)
+            earlier = month_str(cursor)
+            if earlier in stored:
+                return "not_ready", f"{month} 月仓储费报告未出，沿用 {earlier}"
+            rows = self.api.storage_fee_month(sid, earlier)
+            if rows:
+                self._save_storage_rows(sid, earlier, rows)
+                return "not_ready", f"{month} 月仓储费报告未出，改用 {earlier}（{len(rows)} 行）"
+        return "not_ready", f"{month} 月仓储费报告未出，向前 {STORAGE_MONTH_LOOKBACK} 个月均无数据"
 
     def task_return_rate(self, sid: int, today: date) -> tuple[str, str]:
         start = today - timedelta(days=Q_WINDOW_START_DAYS)
@@ -206,6 +243,8 @@ class Engine:
                 "INSERT INTO return_rates(version_id,sid,msku,q,raw,flagged) VALUES(?,?,?,?,?,?)",
                 [(vid, sid, m, q, raw, int(fl)) for m, (q, fl, raw) in parsed.items()],
             )
+        if rows and not parsed:
+            return "failed", f"接口返回 {len(rows)} 行，但没有解析出 msku"
         flagged = sum(1 for v in parsed.values() if v[1])
         return "success", f"{len(parsed)} 个 msku 有 Q" + (f"，{flagged} 个数值>1 已按百分数处理" if flagged else "")
 
@@ -412,7 +451,8 @@ class Engine:
         pending = self._status(sid, TASK_STORAGE_MONTH, month_str(prev_month(today)))
         return StoreContext(
             sid=sid, name=st["name"], site=site, now=now, local_date=today, profit=profit,
-            q=load_return_rates(self.db, sid), dims=load_dims(self.db, sid), age=load_age_snapshot(self.db, sid),
+            q=load_return_rates(self.db, sid), dims=load_dims(self.db, sid),
+            listing_dims=load_listing_dims(self.db, sid), age=load_age_snapshot(self.db, sid),
             fx=fx_rate(self.db, site.currency, today), price=self.active_price(),
             sold=fifo.sold_today(self.db, sid, today), t0=self.db.get(fifo.t0_key(sid)),
             cost_sign=self.cfg.cost_sign,
@@ -456,13 +496,17 @@ class Engine:
         }
 
     def compute(self, sid: int, now: datetime) -> tuple[dict, list[dict]]:
+        summary, rows, _profit = self._compute(sid, now)
+        return summary, rows
+
+    def _compute(self, sid: int, now: datetime) -> tuple[dict, list[dict], dict]:
         ctx = self.build_context(sid, now)
         rows = compute_rows(ctx)
         summary = {**summarize(rows), **self._summary_meta(ctx, rows)}
-        return summary, rows
+        return summary, rows, ctx.profit
 
     def build_snapshot(self, sid: int, now: datetime, run_id: int | None) -> int:
-        summary, rows = self.compute(sid, now)
+        summary, rows, profit = self._compute(sid, now)
         with self.db.tx() as c:
             cur = c.execute(
                 "INSERT INTO snapshots(sid,local_date,taken_at,poll_run_id,summary,rows) VALUES(?,?,?,?,?,?)",
@@ -471,7 +515,29 @@ class Engine:
             )
             c.execute("UPDATE snapshots SET rows=NULL WHERE sid=? AND local_date<? AND rows IS NOT NULL",
                       (sid, summary["local_date"]))
-            return int(cur.lastrowid)
+            snap_id = int(cur.lastrowid)
+        self.history.save_capture(summary, profit, iso(now))
+        return snap_id
+
+    def set_manual_return_rate(self, sid: int, msku: str, percent: float | None) -> None:
+        """手填退货率，百分数。None 表示删掉手填值，回到接口值或 0。"""
+        if self.store(sid) is None:
+            raise ValueError("店铺不存在")
+        msku = msku.strip()
+        if not msku:
+            raise ValueError("缺少 msku")
+        with self.db.tx() as c:
+            if percent is None:
+                c.execute("DELETE FROM manual_return_rates WHERE sid=? AND msku=?", (sid, msku))
+            else:
+                if percent != percent or percent < 0 or percent > 100:
+                    raise ValueError("退货率应在 0 到 100 之间")
+                c.execute(
+                    "INSERT INTO manual_return_rates(sid,msku,q,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(sid,msku) DO UPDATE SET q=excluded.q, updated_at=excluded.updated_at",
+                    (sid, msku, percent / 100.0, iso(self.clock())),
+                )
+        self.rebuild_latest_snapshot(sid)
 
     def rebuild_latest_snapshot(self, sid: int) -> None:
         """价目版本切换后按同一时刻重算最新一张快照，不新增曲线点、不请求接口。"""
@@ -511,6 +577,7 @@ class Engine:
     # ------------------------------------------------------------------ 首次启动
     def bootstrap(self) -> None:
         """第一次启动立刻做完月任务、日任务和开账，再进入 15 分钟循环。"""
+        self.history.import_summaries(self.db)
         self.refresh_stores()
         for s in self.stores():
             if self.daily_due(s["sid"], ignore_time=True):

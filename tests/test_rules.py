@@ -21,6 +21,21 @@ class ReturnRateTest(unittest.TestCase):
 
 
 class FieldsTest(unittest.TestCase):
+    def test_nested_msku_and_sid(self):
+        row = normalize_row({
+            "sids": ["1510"],
+            "price_list": [{"seller_sku": "SKU-1", "asin": "B001", "local_name": "品"}],
+            "net_amount": "12.5",
+            "afn_volume": 3,
+            "gross_profit": "1.2",
+        })
+        self.assertIsNotNone(row)
+        self.assertEqual(row["sid"], 1510)
+        self.assertEqual(row["msku"], "SKU-1")
+        self.assertEqual(row["asin"], "B001")
+        self.assertEqual(row["local_name"], "品")
+        self.assertEqual(row["afn_volume"], 3)
+
     def test_aggregate_same_key_sums(self):
         rows = [normalize_row({"sid": 1, "msku": "A", "net_amount": "10", "afn_volume": 2}),
                 normalize_row({"sid": 1, "msku": "A", "net_amount": 5, "afn_volume": 1})]

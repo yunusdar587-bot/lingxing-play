@@ -70,7 +70,37 @@ def has_any(row: dict, names: tuple[str, ...]) -> bool:
     return any(n in row for n in names)
 
 
+def _first_dict(value: Any) -> dict:
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        return value[0]
+    return {}
+
+
+def order_profit_view(raw: dict) -> dict:
+    """MSKU 维度的 seller_sku、sid 在 price_list / sids 里，不在最外层。"""
+    row = dict(raw)
+    item = _first_dict(raw.get("price_list"))
+    for key in ("seller_sku", "sid", "asin", "fnsku", "local_name", "item_name"):
+        if row.get(key) in (None, "") and item.get(key) not in (None, ""):
+            row[key] = item[key]
+    if row.get("sid") in (None, ""):
+        sids = raw.get("sids")
+        if isinstance(sids, list) and sids:
+            row["sid"] = sids[0]
+        elif sids not in (None, ""):
+            row["sid"] = sids
+    if row.get("asin") in (None, ""):
+        asin = _first_dict(raw.get("asins")).get("asin")
+        if asin not in (None, ""):
+            row["asin"] = asin
+    local_name = _first_dict(raw.get("local_infos")).get("local_name")
+    if row.get("local_name") in (None, "") and local_name not in (None, ""):
+        row["local_name"] = local_name
+    return row
+
+
 def normalize_row(raw: dict, default_sid: int | None = None) -> dict | None:
+    raw = order_profit_view(raw)
     msku = pick(raw, ALIASES["msku"])
     if msku in (None, ""):
         return None

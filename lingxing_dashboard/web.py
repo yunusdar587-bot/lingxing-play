@@ -1,4 +1,4 @@
-"""本地网页看板：只读 JSON 接口 + 唯一写入操作（确认启用新版本价目表）。"""
+"""本地网页看板。写入只有两处：确认新价目版本，以及手填 MSKU 退货率。"""
 from __future__ import annotations
 
 import json
@@ -8,9 +8,10 @@ from datetime import timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .calc import MODE_DAILY, MODE_LABELS, MODE_ORDER
+from .history import assemble
 from .jobs import Engine
 from .sites import SITES
 from .timeutil import iso, local_now
@@ -85,8 +86,9 @@ class DashboardService:
                         totals[mode] += m["adjusted"]
                 entry["snapshot"] = {"taken_at": snaps[-1]["taken_at"], "local_time": cur["local_time"],
                                      "modes": modes, "msku_count": cur["msku_count"], "no_q": cur["no_q_mskus"]}
-                total_tz.append({"name": s["name"], "site": site.name, "tz": site.tz_name,
+                total_tz.append({"sid": s["sid"], "name": s["name"], "site": site.name, "tz": site.tz_name,
                                  "local_date": cur["local_date"],
+                                 "amounts": {k: None if hide else cur[k]["adjusted"] for k in (MODE_DAILY, MODE_ORDER)},
                                  "counted": {k: cur[k]["adjusted"] is not None for k in (MODE_DAILY, MODE_ORDER)}})
                 notices.extend(self._store_notices(s, cur))
             else:
@@ -120,10 +122,12 @@ class DashboardService:
         if cur["storage_report_pending"]:
             if cur["dims_history"]:
                 out.append({"level": "warn", "kind": "storage_report", "sid": sid,
-                            "text": f"{name}：上月仓储费报告未出，沿用 {cur['dims_month']} 的重量、体积和弃置费，每天重试"})
+                            "text": f"{name}：上月仓储费报告未出，沿用 {cur['dims_month']} 的重量和弃置费。"
+                                    f"报告里有体积时，单件体积改用库龄报告；没有体积的改用 Listing 包装尺寸。每天重试"})
             else:
                 out.append({"level": "warn", "kind": "storage_report", "sid": sid,
-                            "text": f"{name}：上月仓储费报告未出，尚无历史尺寸，弃置费显示 0"})
+                            "text": f"{name}：上月仓储费报告未出，尚无历史尺寸，体积和弃置费改用 Listing 包装尺寸；"
+                                    f"Listing 也没有尺寸的按 0 显示。每天重试"})
         if cur["age_snapshot_date"] is None and not cur.get("age_fetched_at"):
             out.append({"level": "warn", "kind": "age", "sid": sid, "text": f"{name}：尚无库龄快照"})
         elif cur["age_stale"]:
@@ -148,7 +152,8 @@ class DashboardService:
         if qw:
             out.append({"level": "info", "kind": "q", "sid": sid,
                         "text": f"{name}：Q 统计窗口 {qw['start']} ~ {qw['end']}，更新于 {qw['computed_at']}"
-                                + (f"；{cur['no_q_mskus']} 个 msku 无 Q，未计入合计" if cur["no_q_mskus"] else "")})
+                                + (f"；{cur['no_q_mskus']} 个有销量的 msku 查不到退货率，已按 0 计入"
+                                   if cur["no_q_mskus"] else "")})
         else:
             out.append({"level": "warn", "kind": "q", "sid": sid, "text": f"{name}：退货率 Q 尚未计算成功"})
         return out
@@ -201,6 +206,19 @@ class DashboardService:
         return {"sid": sid, "name": st["name"], "summary": summary, "rows": rows, "curve": curve,
                 "sign_check": sign, "adjusted_hidden": hide}
 
+    def history_bounds(self) -> dict:
+        return self.engine.history.bounds()
+
+    def history_query(self, start: str, end: str) -> dict:
+        hide = self._sign().get("status") == "failed"
+        rows = self.engine.history.captures_between(start, end)
+        stores = [{"sid": s["sid"], "name": s["name"], "site": s["site"].code,
+                   "site_name": s["site"].name, "tz": s["site"].tz_name} for s in self.engine.stores()]
+        return assemble(stores, rows, start, end, hide)
+
+    def history_detail(self, sid: int, slot: str) -> dict | None:
+        return self.engine.history.detail(sid, slot)
+
 
 def make_handler(service: DashboardService):
     class Handler(BaseHTTPRequestHandler):
@@ -229,12 +247,15 @@ def make_handler(service: DashboardService):
             if ctype.startswith("text/") or ctype.endswith("javascript"):
                 ctype += "; charset=utf-8"
             self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):  # noqa: N802
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
             try:
                 if path in ("/", "/index.html"):
                     return self._static("index.html")
@@ -242,23 +263,47 @@ def make_handler(service: DashboardService):
                     return self._static(path[len("/static/"):])
                 if path == "/api/dashboard":
                     return self._json(service.dashboard())
+                if path == "/api/history/bounds":
+                    return self._json(service.history_bounds())
+                if path == "/api/history":
+                    start = (query.get("start") or [""])[0]
+                    end = (query.get("end") or [""])[0]
+                    return self._json(service.history_query(start, end))
+                if path == "/api/history/detail":
+                    detail = service.history_detail(int((query.get("sid") or ["0"])[0]), (query.get("slot") or [""])[0])
+                    return self._json(detail) if detail else self._json({"error": "该刻度没有留存"}, HTTPStatus.NOT_FOUND)
                 if path.startswith("/api/store/"):
                     detail = service.store_detail(int(path.rsplit("/", 1)[1]))
                     return self._json(detail) if detail else self._json({"error": "店铺不存在"}, HTTPStatus.NOT_FOUND)
-            except ValueError:
-                return self._json({"error": "参数错误"}, HTTPStatus.BAD_REQUEST)
+            except ValueError as exc:
+                return self._json({"error": str(exc) or "参数错误"}, HTTPStatus.BAD_REQUEST)
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self):  # noqa: N802
-            if urlparse(self.path).path != "/api/price-table/confirm":
-                return self._json({"error": "只读看板，不支持该写入"}, HTTPStatus.METHOD_NOT_ALLOWED)
+            path = urlparse(self.path).path
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(length) or b"{}")
-                state = service.engine.confirm_price(str(payload.get("version") or ""))
-            except ValueError as exc:
-                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-            return self._json({"ok": True, "price": state})
+            except (ValueError, json.JSONDecodeError):
+                return self._json({"error": "参数错误"}, HTTPStatus.BAD_REQUEST)
+            if path == "/api/price-table/confirm":
+                try:
+                    state = service.engine.confirm_price(str(payload.get("version") or ""))
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return self._json({"ok": True, "price": state})
+            if path.startswith("/api/store/") and path.endswith("/return-rate"):
+                try:
+                    sid = int(path.split("/")[3])
+                    percent = payload.get("percent")
+                    if percent is not None:
+                        percent = float(percent)
+                    service.engine.set_manual_return_rate(sid, str(payload.get("msku") or ""), percent)
+                except (ValueError, IndexError) as exc:
+                    return self._json({"error": str(exc) or "参数错误"}, HTTPStatus.BAD_REQUEST)
+                detail = service.store_detail(sid)
+                return self._json(detail) if detail else self._json({"error": "店铺不存在"}, HTTPStatus.NOT_FOUND)
+            return self._json({"error": "不支持该写入"}, HTTPStatus.METHOD_NOT_ALLOWED)
 
     return Handler
 

@@ -6,7 +6,7 @@ from lingxing_dashboard.calc import MODE_DAILY, MODE_ORDER, StoreContext, comput
 from lingxing_dashboard.fields import normalize_row
 from lingxing_dashboard.fifo import SoldPiece
 from lingxing_dashboard.pricing import Dims
-from lingxing_dashboard.refdata import AgeSnapshot, DimsSet, FxRate, ReturnRates
+from lingxing_dashboard.refdata import AgeSnapshot, AgeVolume, DimsSet, FxRate, ReturnRates, dims_from_listing
 from lingxing_dashboard.sites import SITES
 
 # 洛杉矶 2026-11-04 12:00（已过一半）
@@ -57,13 +57,22 @@ class ReturnCostTest(unittest.TestCase):
         r = compute_rows(ctx([prow(afn_volume=0, net_amount=0)], q={}))[0]
         self.assertEqual((r["return_cost"], r["return_cost_status"]), (0.0, "ok"))
 
-    def test_missing_q_not_ready_and_excluded(self):
+    def test_missing_q_counts_as_zero(self):
         rows = compute_rows(ctx([prow()], q={}, age={"A": {"0-30": 10}}))
-        self.assertIsNone(rows[0]["return_cost"])
+        self.assertEqual(rows[0]["q_source"], "assumed")
+        self.assertEqual(rows[0]["return_cost"], 0.0)
         s = summarize(rows)
-        self.assertEqual(s[MODE_DAILY]["excluded"], 1)
-        self.assertEqual(s[MODE_DAILY]["excluded_reasons"], {"no_q": 1})
-        self.assertIsNone(s[MODE_DAILY]["adjusted"])
+        self.assertEqual(s[MODE_DAILY]["excluded"], 0)
+        self.assertEqual(s["no_q_mskus"], 1)
+        self.assertIsNotNone(s[MODE_DAILY]["adjusted"])
+
+    def test_manual_q_overrides(self):
+        c = ctx([prow()], q={"A": 0.05}, age={"A": {"0-30": 1}})
+        c.q.q["A"] = 0.10
+        c.q.manual.add("A")
+        rows = compute_rows(c)
+        self.assertEqual(rows[0]["q_source"], "manual")
+        self.assertAlmostEqual(rows[0]["return_cost"], 0.10 * (500 - 0.8 * 75 + rows[0]["disposal_unit_cny"] * 10))
 
 
 class AdjustedProfitTest(unittest.TestCase):
@@ -83,6 +92,34 @@ class AdjustedProfitTest(unittest.TestCase):
         base = 2.40 * vol_ft3
         expect = (10 * base + 2 * (base + 0.50) + 1 * (base + max(6.90 * vol_ft3, 0.30))) / 30 * 7.0
         self.assertAlmostEqual(rows[0]["daily_storage_cny"], expect)
+
+    def test_age_volume_overrides_storage_report(self):
+        c = ctx([prow()], q={"A": 0.05}, age={"A": {"0-30": 10}})
+        c.age.volumes["A"] = AgeVolume(2.0, "cubic feet", "Standard")
+        rows = compute_rows(c)
+        self.assertEqual(rows[0]["daily_storage_status"], "ok")
+        self.assertAlmostEqual(rows[0]["daily_storage_cny"], 10 * 2.40 * 2 / 30 * 7)
+
+    def test_missing_storage_volume_uses_listing_not_age(self):
+        bare = prow(afn_volume=0, net_amount=0, gross_profit=0, refund_amount=0, fba_storage_fee=0,
+                    shared_fba_storage_fee=0, long_term_storage_fee=0, shared_long_term_storage_fee=0,
+                    shared_fba_disposal_fee=0, selling_fee=0)
+        c = ctx([bare], q={}, age={"A": {"0-30": 10}}, with_dims=False)
+        c.age.volumes["A"] = AgeVolume(9.0, "cubic feet", "Oversize")
+        self.assertEqual(compute_rows(c)[0]["daily_storage_status"], "no_volume")
+        # 20×10×10 英寸、25 磅：超出标准件，11 月按大件 $1.40/ft³。库龄里的 9 ft³ 不参与。
+        c.listing_dims["A"] = dims_from_listing({
+            "package_length": "20", "package_length_units_type": "inches",
+            "package_width": "10", "package_width_units_type": "inches",
+            "package_height": "10", "package_height_units_type": "inches",
+            "package_weight": "25", "package_weight_units_type": "pounds",
+        }, fnsku="FA")
+        rows = compute_rows(c)
+        vol = 20 * 10 * 10 / 1728
+        self.assertEqual(rows[0]["daily_storage_status"], "ok")
+        self.assertEqual(rows[0]["dims_month"], "listing")
+        self.assertAlmostEqual(rows[0]["daily_storage_cny"], 10 * 1.40 * vol / 30 * 7)
+        self.assertEqual(rows[0]["disposal_status"], "ok")
 
     def test_no_age_not_ready(self):
         rows = compute_rows(ctx([prow()], q={"A": 0.05}, age={}))

@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 from .db import Database
 from .fields import num
-from .pricing import Dims
+from .pricing import Dims, length_factor, weight_factor
 from .timeutil import month_str, prev_month
 
 AGE_FINE = (
@@ -27,6 +27,54 @@ AGE_REST = (
 # --------------------------------------------------------------------------- 映射
 def listing_map(db: Database, sid: int) -> dict[str, str]:
     return {r["fnsku"]: r["msku"] for r in db.query("SELECT fnsku, msku FROM listing_map WHERE sid=?", (sid,))}
+
+
+def _triplet_cm(info: dict, prefix: str) -> tuple[float, float, float] | None:
+    sides = []
+    for name in ("length", "width", "height"):
+        value = num(info.get(f"{prefix}_{name}"))
+        factor = length_factor(info.get(f"{prefix}_{name}_units_type"))
+        if value <= 0 or factor is None:
+            return None
+        sides.append(value * factor)
+    sides.sort(reverse=True)
+    return sides[0], sides[1], sides[2]
+
+
+def dims_from_listing(info: dict | None, fnsku: str = "") -> Dims | None:
+    """Listing 的包装尺寸优先，没有包装尺寸时用商品尺寸。边长统一成厘米，重量统一成千克。"""
+    if not isinstance(info, dict):
+        return None
+    sides = _triplet_cm(info, "package") or _triplet_cm(info, "item")
+    if sides is None:
+        return None
+    weight = 0.0
+    for prefix in ("package", "item"):
+        value = num(info.get(f"{prefix}_weight"))
+        factor = weight_factor(info.get(f"{prefix}_weight_units_type"))
+        if value > 0 and factor is not None:
+            weight = value * factor
+            break
+    return Dims(
+        fnsku=fnsku, month="listing",
+        longest=sides[0], median=sides[1], shortest=sides[2], length_unit="cm",
+        weight=weight, weight_unit="kg" if weight else "",
+    )
+
+
+def load_listing_dims(db: Database, sid: int) -> dict[str, Dims]:
+    out: dict[str, Dims] = {}
+    for r in db.query(
+        "SELECT fnsku, msku, dimension FROM listing_map WHERE sid=? AND dimension IS NOT NULL", (sid,),
+    ):
+        try:
+            info = json.loads(r["dimension"])
+        except (TypeError, ValueError):
+            continue
+        dims = dims_from_listing(info, fnsku=r["fnsku"])
+        if dims is not None and dims.volume_cm3():
+            out.setdefault(r["msku"], dims)
+    return out
 
 
 # --------------------------------------------------------------------------- 尺寸
@@ -140,20 +188,35 @@ class ReturnRates:
     computed_at: str | None
     q: dict[str, float]
     flagged: set[str]
+    manual: set[str] = field(default_factory=set)
 
 
 def load_return_rates(db: Database, sid: int) -> ReturnRates:
     v = db.one("SELECT * FROM return_rate_versions WHERE sid=? ORDER BY id DESC LIMIT 1", (sid,))
     if not v:
-        return ReturnRates(None, None, None, None, {}, set())
-    rows = db.query("SELECT msku, q, flagged FROM return_rates WHERE version_id=?", (v["id"],))
-    return ReturnRates(
-        v["id"], v["window_start"], v["window_end"], v["computed_at"],
-        {r["msku"]: r["q"] for r in rows}, {r["msku"] for r in rows if r["flagged"]},
-    )
+        rates = ReturnRates(None, None, None, None, {}, set())
+    else:
+        rows = db.query("SELECT msku, q, flagged FROM return_rates WHERE version_id=?", (v["id"],))
+        rates = ReturnRates(
+            v["id"], v["window_start"], v["window_end"], v["computed_at"],
+            {r["msku"]: r["q"] for r in rows}, {r["msku"] for r in rows if r["flagged"]},
+        )
+    for r in db.query("SELECT msku, q FROM manual_return_rates WHERE sid=?", (sid,)):
+        rates.q[r["msku"]] = r["q"]
+        rates.manual.add(r["msku"])
+        rates.flagged.discard(r["msku"])
+    return rates
 
 
 # --------------------------------------------------------------------------- 库龄
+@dataclass
+class AgeVolume:
+    """库龄报告上的单件体积。比月仓储费报告更新，新品入库后第二天就有。"""
+    volume: float
+    unit: str
+    storage_type: str = ""
+
+
 @dataclass
 class AgeSnapshot:
     id: int
@@ -161,6 +224,7 @@ class AgeSnapshot:
     snapshot_date: str | None
     by_msku: dict[str, dict[str, float]]      # msku -> bucket -> 可售件数
     unmapped_fnskus: set[str]
+    volumes: dict[str, AgeVolume] = field(default_factory=dict)
 
 
 def age_buckets(row: dict) -> dict[str, float]:
@@ -188,6 +252,8 @@ def parse_age_snapshot(db: Database, sid: int, r) -> AgeSnapshot:
     mapping = listing_map(db, sid)
     by_msku: dict[str, dict[str, float]] = {}
     unmapped: set[str] = set()
+    volumes: dict[str, AgeVolume] = {}
+    volume_qty: dict[str, float] = {}
     for row in json.loads(r["rows"]):
         msku = row.get("sku") or row.get("msku") or row.get("seller_sku")
         if not msku:
@@ -196,11 +262,18 @@ def parse_age_snapshot(db: Database, sid: int, r) -> AgeSnapshot:
             if row.get("fnsku"):
                 unmapped.add(str(row["fnsku"]))
             continue
+        msku = str(msku)
         buckets = age_buckets(row)
-        agg = by_msku.setdefault(str(msku), {})
+        agg = by_msku.setdefault(msku, {})
         for k, v in buckets.items():
             agg[k] = agg.get(k, 0.0) + v
-    return AgeSnapshot(r["id"], r["fetched_at"], r["snapshot_date"], by_msku, unmapped)
+        vol = num(row.get("item_volume"))
+        unit = str(row.get("volume_unit_measurement") or row.get("volume_units") or "").strip()
+        qty = sum(buckets.values())
+        if vol > 0 and unit and qty >= volume_qty.get(msku, -1):
+            volumes[msku] = AgeVolume(vol, unit, str(row.get("storage_type") or "").strip())
+            volume_qty[msku] = qty
+    return AgeSnapshot(r["id"], r["fetched_at"], r["snapshot_date"], by_msku, unmapped, volumes)
 
 
 def snapshot_date_of(rows: list[dict]) -> str | None:

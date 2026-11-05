@@ -39,6 +39,20 @@ class EngineFlowTest(unittest.TestCase):
                                        "inv_age_0_to_30_days": 3, "inv_age_31_to_60_days": 2,
                                        "inv_age_0_to_90_days": 5}]
 
+    def test_storage_month_uses_earlier_report_when_target_missing(self):
+        self.fake.empty_storage_months[US] = {"2026-10"}
+        status, msg = self.engine.task_storage_month(US, date(2026, 10, 1))
+        self.assertEqual(status, "not_ready")
+        self.assertIn("2026-09", msg)
+        months = [r["month"] for r in self.db.query(
+            "SELECT DISTINCT month FROM storage_fee_rows WHERE sid=? ORDER BY month", (US,))]
+        self.assertEqual(months, ["2026-09"])
+        asked = [p["month"] for path, p in self.fake.calls if path.endswith("storageFeeMonth")]
+        self.assertEqual(asked, ["2026-10", "2026-09"])
+        self.engine.task_storage_month(US, date(2026, 10, 1))
+        asked = [p["month"] for path, p in self.fake.calls if path.endswith("storageFeeMonth")]
+        self.assertEqual(asked, ["2026-10", "2026-09", "2026-10"])
+
     def test_bootstrap_filters_sites_and_opens_books(self):
         self.engine.bootstrap()
         self.assertEqual(sorted(s["sid"] for s in self.engine.stores()), [101, 102, 103, 104])

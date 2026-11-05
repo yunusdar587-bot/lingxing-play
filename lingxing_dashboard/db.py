@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS listing_map (
     fnsku TEXT NOT NULL,
     msku TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    dimension TEXT,                  -- Listing dimension_info，仓储报告没有体积时用
     PRIMARY KEY (sid, fnsku)
 );
 
@@ -156,6 +157,14 @@ CREATE TABLE IF NOT EXISTS received_seen (
     PRIMARY KEY (sid, row_key)
 );
 
+CREATE TABLE IF NOT EXISTS manual_return_rates (
+    sid INTEGER NOT NULL,
+    msku TEXT NOT NULL,
+    q REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (sid, msku)
+);
+
 CREATE TABLE IF NOT EXISTS anomalies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
@@ -178,7 +187,14 @@ class Database:
         if path == ":memory:":
             self._shared = self._open()
         with self._write_lock:
-            self.conn().executescript(SCHEMA)
+            conn = self.conn()
+            conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(listing_map)")}
+        if "dimension" not in cols:
+            conn.execute("ALTER TABLE listing_map ADD COLUMN dimension TEXT")
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False, isolation_level=None)

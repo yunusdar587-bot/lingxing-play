@@ -5,6 +5,8 @@ const state = {
   dashboard: null,
   selected: null,
   detail: null,
+  excluded: new Set(JSON.parse(localStorage.getItem("excludedSids") || "[]").map(Number)),
+  history: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -63,11 +65,28 @@ function renderSignBanner(d) {
 }
 
 function renderTotal(d) {
-  const amounts = d.total.amounts;
-  $("total-value").textContent = d.adjusted_hidden ? "—（符号验收未通过）" : cny(amounts ? amounts[state.mode] : null);
+  const listed = d.total.stores;
+  const picked = listed.filter((s) => !state.excluded.has(s.sid));
+  let sum = 0;
+  let any = false;
+  for (const s of picked) {
+    const amt = s.amounts ? s.amounts[state.mode] : null;
+    if (amt === null || amt === undefined) continue;
+    sum += amt;
+    any = true;
+  }
+  $("total-label").textContent = picked.length === listed.length
+    ? "全部店铺人民币合计（各店「本店今天」相加）"
+    : `已勾选 ${picked.length} 家店铺人民币合计（各店「本店今天」相加）`;
+  $("store-pick-summary").textContent = `参与合计的店铺（${picked.length}/${listed.length}）`;
+  $("total-value").textContent = d.adjusted_hidden ? "—（符号验收未通过）" : any || !picked.length ? cny(any ? sum : 0) : "—";
   $("total-mode").textContent = d.mode_labels[state.mode];
-  $("total-tz").innerHTML = d.total.stores
-    .map((s) => `<span class="tz-chip">${esc(s.name)} · ${esc(s.site)} · ${esc(s.tz)} · ${esc(s.local_date)}${s.counted && !s.counted[state.mode] ? " · 未就绪，未计入" : ""}</span>`)
+  $("total-tz").innerHTML = listed
+    .map((s) => {
+      const on = !state.excluded.has(s.sid);
+      const note = s.counted && !s.counted[state.mode] ? " · 未就绪，未计入" : "";
+      return `<label class="tz-chip${on ? "" : " off"}"><input class="store-check" type="checkbox" data-sid="${s.sid}"${on ? " checked" : ""}>${esc(s.name)} · ${esc(s.site)} · ${esc(s.tz)} · ${esc(s.local_date)}${esc(note)}</label>`;
+    })
     .join("");
 }
 
@@ -137,6 +156,8 @@ function renderPrice(d) {
 }
 
 function renderNotices(d) {
+  const summary = $("notice-card").querySelector("summary");
+  summary.textContent = `提示（${d.notices.length}）`;
   $("notices").innerHTML = d.notices.map((n) => `<li class="${esc(n.level)}">${esc(n.text)}</li>`).join("");
   $("polls").innerHTML = d.polls
     .map((p) => `<tr><td>${esc((p.scheduled_at || "").replace("T", " ").slice(5, 16))} UTC</td><td>${esc(p.status)}</td><td>${esc(p.message || "")}</td></tr>`)
@@ -210,7 +231,7 @@ function statusTag(st, okText) {
 
 function renderMskuTable(detail) {
   const mode = state.mode === "order" && detail.summary.order.fallback_to_daily ? "daily" : state.mode;
-  const head = `<tr><th>MSKU</th><th class="num">销量</th><th class="num">Q</th><th class="num">预计退货成本</th>
+  const head = `<tr><th>MSKU</th><th class="num">销量</th><th class="num">退货率 %</th><th class="num">预计退货成本</th>
     <th class="num">单件弃置费</th><th class="num">单日仓储费</th><th class="num">已过时段仓储</th>
     <th>订单仓储费</th><th class="num">调整后毛利</th></tr>`;
   const body = detail.rows
@@ -220,7 +241,11 @@ function renderMskuTable(detail) {
         r.order_storage_status === "ok"
           ? `${cny(r.order_storage_cny)} <span class="sub">已知 ${r.order_known_units} 件</span>`
           : `${statusTag(r.order_storage_status)} <span class="sub">已知 ${r.order_known_units} / 未知 ${r.order_unknown_units} 件</span>`;
-      const q = r.q === null || r.q === undefined ? statusTag("no_q") : pct(r.q) + (r.q_flagged ? ' <span class="tag warn" title="原值大于 1，已按百分数处理">已打标</span>' : "");
+      const qPct = r.q === null || r.q === undefined ? "" : String(Math.round(r.q * 10000) / 100);
+      const qHint = r.q_source === "manual" ? "手填" : r.q_source === "assumed" ? "查不到，暂按 0" : (r.q_flagged ? "已打标" : "");
+      const q = `<input class="q-input" type="number" min="0" max="100" step="0.01" inputmode="decimal"
+        data-msku="${esc(r.msku)}" value="${esc(qPct)}" aria-label="${esc(r.msku)} 退货率百分数">`
+        + (qHint ? `<div class="sub">${esc(qHint)}</div>` : "");
       const rc = r.return_cost_status === "ok" ? cny(r.return_cost) : `<span class="tag warn">未就绪</span>`;
       const disp = cny(r.disposal_unit_cny) + (r.disposal_status !== "ok" ? " " + statusTag(r.disposal_status) : "");
       const daily = r.daily_storage_status === "ok" ? cny(r.daily_storage_cny) : statusTag(r.daily_storage_status);
@@ -267,6 +292,87 @@ async function loadDetail() {
   renderDetail();
 }
 
+function slotValue(input) {
+  return input.value ? input.value.replace("T", " ") : "";
+}
+
+function renderHistory() {
+  const box = $("hist-result");
+  const view = state.history;
+  if (!view) {
+    box.innerHTML = "";
+    return;
+  }
+  let sum = 0;
+  let any = false;
+  let html = "";
+  for (const store of view.stores) {
+    const last = store.points.length ? store.points[store.points.length - 1] : null;
+    const lastAmt = last ? last.adjusted[state.mode] : null;
+    if (!state.excluded.has(store.sid) && lastAmt !== null && lastAmt !== undefined) {
+      sum += lastAmt;
+      any = true;
+    }
+    const rows = store.points.map((p) => {
+      const amt = p.adjusted[state.mode];
+      return `<tr>
+        <td>${esc(p.local_slot)}</td>
+        <td class="num">${amt === null || amt === undefined ? "—" : cny(amt)}</td>
+        <td class="num">${p.afn_volume === null || p.afn_volume === undefined ? "—" : fmt(p.afn_volume, 0)}</td>
+        <td class="num">${p.msku_count ?? "—"}</td>
+        <td><button class="link" type="button" data-sid="${store.sid}" data-slot="${esc(p.local_slot)}">${p.has_payload ? "接口明细" : "仅汇总"}</button></td>
+      </tr>`;
+    }).join("");
+    html += `<div class="history-store">
+      <h3>${esc(store.name)} <span class="sub">${esc(store.site_name)} · ${esc(store.tz)} · 留存 ${store.kept}/${view.slot_count}</span></h3>
+      ${rows ? `<table class="history-table"><tr><th>当地刻度</th><th class="num">调整后毛利</th><th class="num">销量</th><th class="num">MSKU</th><th></th></tr>${rows}</table>` : `<div class="sub">这一段没有留存</div>`}
+      <div class="hist-detail" id="hist-detail-${store.sid}"></div>
+    </div>`;
+  }
+  const total = state.dashboard && state.dashboard.adjusted_hidden ? "—（符号验收未通过）" : any ? cny(sum) : "—";
+  box.innerHTML = `<div class="sub">${esc(view.start)} 至 ${esc(view.end)}，每 15 分钟。已勾选店铺在各自区间内最后一条留存的合计 ${total}。每条是该店当地 0 点到该刻度的累计，不是这 15 分钟的增量。</div>${html}`;
+}
+
+async function loadHistoryBounds() {
+  try {
+    const b = await getJSON("/api/history/bounds");
+    const note = $("hist-note");
+    if (!b.count) {
+      note.textContent = "库里还没有留存。下一次 15 分钟轮询之后可以拉取。时刻按各店自己的时区。";
+      return;
+    }
+    note.textContent = `库内 ${b.count} 条，最早 ${b.min}，最晚 ${b.max}。开始和结束是钟面时间，各店按自己的时区去对，只返回已经留下的刻度。`;
+    if (!$("hist-start").value) $("hist-start").value = b.max.slice(0, 10) + "T00:00";
+    if (!$("hist-end").value) $("hist-end").value = b.max.replace(" ", "T");
+  } catch (e) {
+    $("hist-note").textContent = "历史库读取失败：" + e.message;
+  }
+}
+
+async function pullHistory() {
+  const start = slotValue($("hist-start"));
+  const end = slotValue($("hist-end"));
+  const btn = $("hist-load");
+  if (!start || !end) {
+    $("hist-note").textContent = "请先选择开始和结束时刻。";
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/history?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, { cache: "no-store" });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || r.status);
+    state.history = body;
+    renderHistory();
+  } catch (e) {
+    state.history = null;
+    $("hist-result").innerHTML = "";
+    $("hist-note").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderAll() {
   const d = state.dashboard;
   if (!d) return;
@@ -277,6 +383,7 @@ function renderAll() {
   renderStores(d);
   renderPrice(d);
   renderNotices(d);
+  renderHistory();
   renderDetail();
 }
 
@@ -286,10 +393,86 @@ async function refresh() {
     if (!state.selected && state.dashboard.stores.length) state.selected = state.dashboard.stores[0].sid;
     renderAll();
     await loadDetail();
+    if (!state.historyBoundsLoaded) {
+      state.historyBoundsLoaded = true;
+      await loadHistoryBounds();
+    }
   } catch (e) {
     $("generated").textContent = "加载失败：" + e.message;
   }
 }
+
+$("msku-table").addEventListener("change", async (ev) => {
+  const input = ev.target;
+  if (!input.classList || !input.classList.contains("q-input") || !state.selected) return;
+  const raw = input.value.trim();
+  const percent = raw === "" ? null : Number(raw);
+  if (percent !== null && (!Number.isFinite(percent) || percent < 0 || percent > 100)) {
+    input.classList.add("bad");
+    return;
+  }
+  input.classList.remove("bad");
+  input.disabled = true;
+  try {
+    const res = await fetch(`/api/store/${state.selected}/return-rate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ msku: input.dataset.msku, percent }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || res.status);
+    state.detail = body;
+    state.dashboard = await getJSON("/api/dashboard");
+    renderAll();
+  } catch (e) {
+    input.disabled = false;
+    input.classList.add("bad");
+    $("generated").textContent = "退货率保存失败：" + e.message;
+  }
+});
+
+$("hist-load").addEventListener("click", pullHistory);
+$("hist-result").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button.link");
+  if (!btn) return;
+  const sid = btn.dataset.sid;
+  const slot = btn.dataset.slot;
+  const host = $("hist-detail-" + sid);
+  if (!host) return;
+  host.innerHTML = `<div class="sub">读取 ${esc(slot)} …</div>`;
+  try {
+    const d = await getJSON(`/api/history/detail?sid=${encodeURIComponent(sid)}&slot=${encodeURIComponent(slot)}`);
+    if (!d.has_payload) {
+      host.innerHTML = `<div class="sub">${esc(slot)} 只有汇总，没有接口明细。</div>`;
+      return;
+    }
+    if (!d.rows.length) {
+      host.innerHTML = `<div class="sub">${esc(slot)} 的接口没有订单行。</div>`;
+      return;
+    }
+    const cur = d.currency || "";
+    const body = d.rows.map((r) => `<tr>
+      <td>${esc(r.msku)}</td><td class="num">${fmt(r.afn_volume, 0)}</td>
+      <td class="num">${fmt(r.gross_profit)}</td><td class="num">${fmt(r.net_amount)}</td>
+      <td class="num">${fmt(r.selling_fee)}</td><td class="num">${fmt(r.refund_amount)}</td>
+    </tr>`).join("");
+    host.innerHTML = `<div class="sub">${esc(d.name)} ${esc(slot)} 接口原值${cur ? "（" + esc(cur) + "）" : ""}，该店当地 0 点至该刻度累计</div>
+      <table class="history-table"><tr><th>MSKU</th><th class="num">销量</th><th class="num">原毛利</th><th class="num">净额</th><th class="num">销售佣金</th><th class="num">退款</th></tr>${body}</table>`;
+  } catch (e) {
+    host.innerHTML = `<div class="sub">读取失败：${esc(e.message)}</div>`;
+  }
+});
+
+$("total-tz").addEventListener("change", (ev) => {
+  const box = ev.target;
+  if (!box.classList || !box.classList.contains("store-check") || !state.dashboard) return;
+  const sid = Number(box.dataset.sid);
+  if (box.checked) state.excluded.delete(sid);
+  else state.excluded.add(sid);
+  localStorage.setItem("excludedSids", JSON.stringify([...state.excluded]));
+  renderTotal(state.dashboard);
+  renderHistory();
+});
 
 document.querySelectorAll(".mode-switch button").forEach((b) =>
   b.addEventListener("click", () => {
