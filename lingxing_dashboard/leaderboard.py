@@ -238,7 +238,7 @@ class LeaderboardService:
             columns.append({
                 "name": col["name"],
                 "stores": [names.get(s, str(s)) for s in col["sids"]],
-                "total": {"afn_volume": sales, "adjusted": None if hidden else profit,
+                "total": {"afn_volume": sales, "adjusted": None if hidden or not rows else profit,
                           "margin": None if hidden or not net else profit / net},
                 "rows": out_rows,
             })

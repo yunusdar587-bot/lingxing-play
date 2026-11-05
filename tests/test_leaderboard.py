@@ -131,6 +131,7 @@ class LeaderboardTest(unittest.TestCase):
         self.assertEqual(board["columns"][1]["rows"], [])
         self.assertEqual(board["columns"][1]["total"]["afn_volume"], 0)
         self.assertIsNone(board["columns"][1]["total"]["margin"])
+        self.assertIsNone(board["columns"][1]["total"]["adjusted"])
 
     def test_order_mode_excludes_unknown_lots_without_fallback(self):
         self.svc.save_config(payload(self.svc, mode="order"))
